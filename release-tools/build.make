@@ -21,6 +21,10 @@ SHELL := /bin/bash
 # set in main Makefile of a repository.
 # CMDS=
 
+# Normally, commands are expected in "cmd". That can be changed for a
+# repository to something else by setting CMDS_DIR before including build.make.
+CMDS_DIR ?= cmd
+
 # This is the default. It can be overridden in the main Makefile after
 # including build.make.
 REGISTRY_NAME?=quay.io/k8scsi
@@ -66,7 +70,7 @@ endif
 # Specific packages can be excluded from each of the tests below by setting the *_FILTER_CMD variables
 # to something like "| grep -v 'github.com/kubernetes-csi/project/pkg/foobar'". See usage below.
 
-# BUILD_PLATFORMS contains a set of tuples [os arch suffix base_image addon_image]
+# BUILD_PLATFORMS contains a set of tuples [os arch buildx_platform suffix base_image addon_image]
 # separated by semicolon. An empty variable or empty entry (= just a
 # semicolon) builds for the default platform of the current Go
 # toolchain.
@@ -81,24 +85,24 @@ FULL_LDFLAGS = $(LDFLAGS) $(IMPORTPATH_LDFLAGS) $(EXT_LDFLAGS)
 # defined by BUILD_PLATFORMS.
 $(CMDS:%=build-%): build-%: check-go-version-go
 	mkdir -p bin
-	# os_arch_seen captures all of the $$os-$$arch seen for the current binary
-	# that we want to build, if we've seen an $$os-$$arch before it means that
+	# os_arch_seen captures all of the $$os-$$arch-$$buildx_platform seen for the current binary
+	# that we want to build, if we've seen an $$os-$$arch-$$buildx_platform before it means that
 	# we don't need to build it again, this is done to avoid building
 	# the windows binary multiple times (see the default value of $$BUILD_PLATFORMS)
-	export os_arch_seen="" && echo '$(BUILD_PLATFORMS)' | tr ';' '\n' | while read -r os arch suffix base_image addon_image; do \
-		os_arch_seen_pre=$${os_arch_seen%%$$os-$$arch*}; \
+	export os_arch_seen="" && echo '$(BUILD_PLATFORMS)' | tr ';' '\n' | while read -r os arch buildx_platform suffix base_image addon_image; do \
+		os_arch_seen_pre=$${os_arch_seen%%$$os-$$arch-$$buildx_platform*}; \
 		if ! [ $${#os_arch_seen_pre} = $${#os_arch_seen} ]; then \
 			continue; \
 		fi; \
-		if ! (set -x; CGO_ENABLED=0 GOOS="$$os" GOARCH="$$arch" go build $(GOFLAGS_VENDOR) -a -ldflags '$(FULL_LDFLAGS)' -o "./bin/$*$$suffix" ./cmd/$*); then \
+		if ! (set -x; cd ./$(CMDS_DIR)/$* && CGO_ENABLED=0 GOOS="$$os" GOARCH="$$arch" go build $(GOFLAGS_VENDOR) -a -ldflags '$(FULL_LDFLAGS)' -o "$(abspath ./bin)/$*$$suffix" .); then \
 			echo "Building $* for GOOS=$$os GOARCH=$$arch failed, see error(s) above."; \
 			exit 1; \
 		fi; \
-		os_arch_seen+=";$$os-$$arch"; \
+		os_arch_seen+=";$$os-$$arch-$$buildx_platform"; \
 	done
 
 $(CMDS:%=container-%): container-%: build-%
-	docker build -t $*:latest -f $(shell if [ -e ./cmd/$*/Dockerfile ]; then echo ./cmd/$*/Dockerfile; else echo Dockerfile; fi) --label revision=$(REV) .
+	docker build -t $*:latest -f $(shell if [ -e ./$(CMDS_DIR)/$*/Dockerfile ]; then echo ./$(CMDS_DIR)/$*/Dockerfile; else echo Dockerfile; fi) --label revision=$(REV) .
 
 $(CMDS:%=push-%): push-%: container-%
 	set -ex; \
@@ -133,7 +137,7 @@ DOCKER_BUILDX_CREATE_ARGS ?=
 # This target builds a multiarch image for one command using Moby BuildKit builder toolkit.
 # Docker Buildx is included in Docker 19.03.
 #
-# ./cmd/<command>/Dockerfile[.Windows] is used if found, otherwise Dockerfile[.Windows].
+# ./$(CMDS_DIR)/<command>/Dockerfile[.Windows] is used if found, otherwise Dockerfile[.Windows].
 # It is currently optional: if no such file exists, Windows images are not included,
 # even when Windows is listed in BUILD_PLATFORMS. That way, projects can test that
 # Windows binaries can be built before adding a Dockerfile for it.
@@ -146,20 +150,21 @@ $(CMDS:%=push-multiarch-%): push-multiarch-%: check-pull-base-ref build-%
 	export DOCKER_CLI_EXPERIMENTAL=enabled; \
 	docker buildx create $(DOCKER_BUILDX_CREATE_ARGS) --use --name multiarchimage-buildertest; \
 	trap "docker buildx rm multiarchimage-buildertest" EXIT; \
-	dockerfile_linux=$$(if [ -e ./cmd/$*/Dockerfile ]; then echo ./cmd/$*/Dockerfile; else echo Dockerfile; fi); \
-	dockerfile_windows=$$(if [ -e ./cmd/$*/Dockerfile.Windows ]; then echo ./cmd/$*/Dockerfile.Windows; else echo Dockerfile.Windows; fi); \
+	dockerfile_linux=$$(if [ -e ./$(CMDS_DIR)/$*/Dockerfile ]; then echo ./$(CMDS_DIR)/$*/Dockerfile; else echo Dockerfile; fi); \
+	dockerfile_windows=$$(if [ -e ./$(CMDS_DIR)/$*/Dockerfile.Windows ]; then echo ./$(CMDS_DIR)/$*/Dockerfile.Windows; else echo Dockerfile.Windows; fi); \
 	if [ '$(BUILD_PLATFORMS)' ]; then build_platforms='$(BUILD_PLATFORMS)'; else build_platforms="linux amd64"; fi; \
 	if ! [ -f "$$dockerfile_windows" ]; then \
-		build_platforms="$$(echo "$$build_platforms" | sed -e 's/windows *[^ ]* *.exe *[^ ]* *[^ ]*//g' -e 's/; *;/;/g' -e 's/;[ ]*$$//')"; \
+		build_platforms="$$(echo "$$build_platforms" | sed -e 's/windows *[^ ]* *[^ ]* *.exe *[^ ]* *[^ ]*//g' -e 's/; *;/;/g' -e 's/;[ ]*$$//')"; \
 	fi; \
 	pushMultiArch () { \
 		tag=$$1; \
-		echo "$$build_platforms" | tr ';' '\n' | while read -r os arch suffix base_image addon_image; do \
+		echo "$$build_platforms" | tr ';' '\n' | while read -r os arch buildx_platform suffix base_image addon_image; do \
 			escaped_base_image=$${base_image/:/-}; \
+			escaped_buildx_platform=$${buildx_platform//\//-}; \
 			if ! [ -z $$escaped_base_image ]; then escaped_base_image+="-"; fi; \
 			docker buildx build --push \
-				--tag $(IMAGE_NAME):$$arch-$$os-$$escaped_base_image$$tag \
-				--platform=$$os/$$arch \
+				--tag $(IMAGE_NAME):$$escaped_buildx_platform-$$os-$$escaped_base_image$$tag \
+				--platform=$$os/$$buildx_platform \
 				--file $$(eval echo \$${dockerfile_$$os}) \
 				--build-arg binary=./bin/$*$$suffix \
 				--build-arg ARCH=$$arch \
@@ -168,13 +173,14 @@ $(CMDS:%=push-multiarch-%): push-multiarch-%: check-pull-base-ref build-%
 				--label revision=$(REV) \
 				.; \
 		done; \
-		images=$$(echo "$$build_platforms" | tr ';' '\n' | while read -r os arch suffix base_image addon_image; do \
+		images=$$(echo "$$build_platforms" | tr ';' '\n' | while read -r os arch buildx_platform suffix base_image addon_image; do \
 			escaped_base_image=$${base_image/:/-}; \
+			escaped_buildx_platform=$${buildx_platform//\//-}; \
 			if ! [ -z $$escaped_base_image ]; then escaped_base_image+="-"; fi; \
-			echo $(IMAGE_NAME):$$arch-$$os-$$escaped_base_image$$tag; \
+			echo $(IMAGE_NAME):$$escaped_buildx_platform-$$os-$$escaped_base_image$$tag; \
 		done); \
 		docker manifest create --amend $(IMAGE_NAME):$$tag $$images; \
-		echo "$$build_platforms" | tr ';' '\n' | while read -r os arch suffix base_image addon_image; do \
+		echo "$$build_platforms" | tr ';' '\n' | while read -r os arch buildx_platform suffix base_image addon_image; do \
 			if [ $$os = "windows" ]; then \
 				escaped_base_image=$${base_image/:/-}; \
 				if ! [ -z $$escaped_base_image ]; then escaped_base_image+="-"; fi; \
