@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -35,7 +36,7 @@ import (
 func nodeRegister(csiDriverName, httpEndpoint string) {
 	// When kubeletRegistrationPath is specified then driver-registrar ONLY acts
 	// as gRPC server which replies to registration requests initiated by kubelet's
-	// pluginswatcher infrastructure. Node labeling is done by kubelet's csi code.
+	// plugins watcher infrastructure. Node labeling is done by kubelet's csi code.
 	registrar := newRegistrationServer(csiDriverName, *kubeletRegistrationPath, supportedVersions)
 	socketPath := buildSocketPath(csiDriverName)
 	if err := util.CleanupSocketFile(socketPath); err != nil {
@@ -61,14 +62,14 @@ func nodeRegister(csiDriverName, httpEndpoint string) {
 	klog.Infof("Registration Server started at: %s\n", socketPath)
 	grpcServer := grpc.NewServer()
 
-	// Before registing node-driver-registrar with the kubelet ensure that the lockfile doesn't exist
+	// Before registering node-driver-registrar with the kubelet ensure that the lockfile doesn't exist
 	// a lockfile may exist because the container was forcefully shutdown
 	util.CleanupFile(registrationProbePath)
 
 	// Registers kubelet plugin watcher api.
 	registerapi.RegisterRegistrationServer(grpcServer, registrar)
 
-	go healthzServer(socketPath, httpEndpoint)
+	go httpServer(socketPath, httpEndpoint)
 	go removeRegSocket(csiDriverName)
 	// Starts service
 	if err := grpcServer.Serve(lis); err != nil {
@@ -86,14 +87,16 @@ func buildSocketPath(csiDriverName string) string {
 	return fmt.Sprintf("%s/%s-reg.sock", *pluginRegistrationPath, csiDriverName)
 }
 
-func healthzServer(socketPath string, httpEndpoint string) {
+func httpServer(socketPath string, httpEndpoint string) {
 	if httpEndpoint == "" {
-		klog.Infof("Skipping healthz server because HTTP endpoint is set to: %q", httpEndpoint)
+		klog.Infof("Skipping HTTP server because endpoint is set to: %q", httpEndpoint)
 		return
 	}
-	klog.Infof("Starting healthz server at HTTP endpoint: %v\n", httpEndpoint)
+	klog.Infof("Starting HTTP server at endpoint: %v\n", httpEndpoint)
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
+	// Prepare http endpoint for healthz + profiling (if enabled)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
 		socketExists, err := util.DoesSocketExist(socketPath)
 		if err == nil && socketExists {
 			w.WriteHeader(http.StatusOK)
@@ -110,7 +113,17 @@ func healthzServer(socketPath string, httpEndpoint string) {
 		}
 	})
 
-	klog.Fatal(http.ListenAndServe(httpEndpoint, nil))
+	if *enableProfile {
+		klog.InfoS("Starting profiling", "endpoint", httpEndpoint)
+
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+
+	klog.Fatal(http.ListenAndServe(httpEndpoint, mux))
 }
 
 func removeRegSocket(csiDriverName string) {
