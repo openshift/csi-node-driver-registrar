@@ -22,12 +22,9 @@ import (
 	"fmt"
 	_ "net/http/pprof"
 	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
-	"github.com/kubernetes-csi/csi-lib-utils/metrics"
-	"github.com/kubernetes-csi/node-driver-registrar/pkg/util"
 	"k8s.io/klog/v2"
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
@@ -45,18 +42,9 @@ const (
 )
 
 const (
-	// ModeRegistration runs node-driver-registrar as a long running process
-	ModeRegistration = "registration"
-
 	// ModeKubeletRegistrationProbe makes node-driver-registrar act as an exec probe
 	// that checks if the kubelet plugin registration succeeded.
 	ModeKubeletRegistrationProbe = "kubelet-registration-probe"
-)
-
-var (
-	// The registration probe path, set when the program runs and used as the path of the file
-	// to create when the kubelet plugin registration succeeds.
-	registrationProbePath = ""
 )
 
 // Command line flags
@@ -69,7 +57,7 @@ var (
 	healthzPort             = flag.Int("health-port", 0, "(deprecated) TCP port for healthz requests. Set to 0 to disable the healthz server. Only one of `--health-port` and `--http-endpoint` can be set.")
 	httpEndpoint            = flag.String("http-endpoint", "", "The TCP network address where the HTTP server for diagnostics, including pprof and the health check indicating whether the registration socket exists, will listen (example: `:8080`). The default is empty string, which means the server is disabled. Only one of `--health-port` and `--http-endpoint` can be set.")
 	showVersion             = flag.Bool("version", false, "Show version.")
-	mode                    = flag.String("mode", ModeRegistration, `The running mode of node-driver-registrar. "registration" runs node-driver-registrar as a long running process. "kubelet-registration-probe" runs as a health check and returns a status code of 0 if the driver was registered successfully, in the probe definition make sure that the value of --kubelet-registration-path is the same as in the container.`)
+	mode                    = flag.String("mode", "", "DEPRECATED. If this is set to kubelet-registration-probe, the driver will exit successfully without registering with CSI. If set to any other value node-driver-registrar will do the kubelet plugin registration. This flag will be removed in a future major release because the mode kubelet-registration-probe is no longer needed.")
 	enableProfile           = flag.Bool("enable-pprof", false, "enable pprof profiling")
 
 	// Set during compilation time
@@ -100,14 +88,6 @@ func newRegistrationServer(driverName string, endpoint string, versions []string
 // GetInfo is the RPC invoked by plugin watcher
 func (e registrationServer) GetInfo(ctx context.Context, req *registerapi.InfoRequest) (*registerapi.PluginInfo, error) {
 	klog.Infof("Received GetInfo call: %+v", req)
-
-	// on successful registration, create the registration probe file
-	err := util.TouchFile(registrationProbePath)
-	if err != nil {
-		klog.ErrorS(err, "Failed to create registration probe file", "registrationProbePath", registrationProbePath)
-	} else {
-		klog.InfoS("Kubelet registration probe created", "path", registrationProbePath)
-	}
 
 	return &registerapi.PluginInfo{
 		Type:              registerapi.CSIPlugin,
@@ -145,22 +125,10 @@ func main() {
 		klog.Error("kubelet-registration-path is a required parameter")
 		os.Exit(1)
 	}
-	// set after we made sure that *kubeletRegistrationPath exists
-	kubeletRegistrationPathDir := filepath.Dir(*kubeletRegistrationPath)
-	registrationProbePath = filepath.Join(kubeletRegistrationPathDir, "registration")
 
-	// with the mode kubelet-registration-probe
 	if modeIsKubeletRegistrationProbe() {
-		lockfileExists, err := util.DoesFileExist(registrationProbePath)
-		if err != nil {
-			klog.Fatalf("Failed to check if registration path exists, registrationProbePath=%s err=%v", registrationProbePath, err)
-			os.Exit(1)
-		}
-		if !lockfileExists {
-			klog.Fatalf("Kubelet plugin registration hasn't succeeded yet, file=%s doesn't exist.", registrationProbePath)
-			os.Exit(1)
-		}
-		klog.Infof("Kubelet plugin registration succeeded.")
+		// This is no longer needed, see https://github.com/kubernetes-csi/node-driver-registrar/issues/309.
+		// In case this mode is still in use, it will succeed as a no-op.
 		os.Exit(0)
 	}
 
@@ -182,15 +150,12 @@ func main() {
 		klog.Warning("--connection-timeout is deprecated and will have no effect")
 	}
 
-	// Unused metrics manager, necessary for connection.Connect below
-	cmm := metrics.NewCSIMetricsManagerForSidecar("")
-
 	// Once https://github.com/container-storage-interface/spec/issues/159 is
 	// resolved, if plugin does not support PUBLISH_UNPUBLISH_VOLUME, then we
 	// can skip adding mapping to "csi.volume.kubernetes.io/nodeid" annotation.
 
 	klog.V(1).Infof("Attempting to open a gRPC connection with: %q", *csiAddress)
-	csiConn, err := connection.Connect(*csiAddress, cmm)
+	csiConn, err := connection.ConnectWithoutMetrics(*csiAddress)
 	if err != nil {
 		klog.Errorf("error connecting to CSI driver: %v", err)
 		os.Exit(1)
@@ -205,9 +170,8 @@ func main() {
 		klog.Errorf("error retreiving CSI driver name: %v", err)
 		os.Exit(1)
 	}
-
 	klog.V(2).Infof("CSI driver name: %q", csiDriverName)
-	cmm.SetDriverName(csiDriverName)
+	defer closeGrpcConnection(*csiAddress, csiConn)
 
 	// Run forever
 	nodeRegister(csiDriverName, addr)
