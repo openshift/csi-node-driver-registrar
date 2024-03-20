@@ -7,6 +7,6 @@ exclude:
     - release-tools/**
 ignore:
   '70e6ca29-d34f-4f91-93b0-737ba4cfedb4':
-  - cmd > csi-node-driver-registrar
+  - '*'
   'a10882d5-9119-41c6-ac51-6042558cb5bf':
-  - cmd > csi-node-driver-registrar
+  - '*'
