@@ -35,15 +35,16 @@ import (
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 )
 
-func nodeRegister(csiDriverName, httpEndpoint string) {
+func nodeRegister(ctx context.Context, csiDriverName, httpEndpoint string) {
 	// When kubeletRegistrationPath is specified then driver-registrar ONLY acts
 	// as gRPC server which replies to registration requests initiated by kubelet's
 	// plugins watcher infrastructure. Node labeling is done by kubelet's csi code.
+	logger := klog.FromContext(ctx)
 	registrar := newRegistrationServer(csiDriverName, *kubeletRegistrationPath, supportedVersions)
 	socketPath := buildSocketPath(csiDriverName)
 	if err := util.CleanupSocketFile(socketPath); err != nil {
-		klog.Errorf("%+v", err)
-		os.Exit(1)
+		logger.Error(err, "")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	var oldmask int
@@ -52,27 +53,33 @@ func nodeRegister(csiDriverName, httpEndpoint string) {
 		oldmask, _ = util.Umask(0077)
 	}
 
-	klog.Infof("Starting Registration Server at: %s\n", socketPath)
+	logger.Info("Starting Registration Server", "socketPath", socketPath)
 	lis, err := net.Listen("unix", socketPath)
 	if err != nil {
-		klog.Errorf("failed to listen on socket: %s with error: %+v", socketPath, err)
-		os.Exit(1)
+		logger.Error(err, "Failed to listen on socket", "socketPath", socketPath)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 	if runtime.GOOS == "linux" {
 		util.Umask(oldmask)
 	}
-	klog.Infof("Registration Server started at: %s\n", socketPath)
-	grpcServer := grpc.NewServer()
+
+	logger.Info("Registration Server started", "socketPath", socketPath)
+	opts := []grpc.ServerOption{
+		grpc.UnaryInterceptor(func(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+			return handler(klog.NewContext(ctx, logger), req)
+		}),
+	}
+	grpcServer := grpc.NewServer(opts...)
 
 	// Registers kubelet plugin watcher api.
 	registerapi.RegisterRegistrationServer(grpcServer, registrar)
 
-	go httpServer(socketPath, httpEndpoint, csiDriverName)
-	go removeRegSocket(csiDriverName)
+	go httpServer(ctx, socketPath, httpEndpoint, csiDriverName)
+	go removeRegSocket(logger, csiDriverName)
 	// Starts service
 	if err := grpcServer.Serve(lis); err != nil {
-		klog.Errorf("Registration Server stopped serving: %v", err)
-		os.Exit(1)
+		logger.Error(err, "Registration Server stopped serving")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	// If gRPC server is gracefully shutdown, cleanup and exit
@@ -83,41 +90,43 @@ func buildSocketPath(csiDriverName string) string {
 	return fmt.Sprintf("%s/%s-reg.sock", *pluginRegistrationPath, csiDriverName)
 }
 
-func httpServer(socketPath string, httpEndpoint string, csiDriverName string) {
+func httpServer(ctx context.Context, socketPath string, httpEndpoint string, csiDriverName string) {
+	logger := klog.FromContext(ctx)
 	if httpEndpoint == "" {
-		klog.Infof("Skipping HTTP server because endpoint is set to: %q", httpEndpoint)
+		logger.Info("Skipping HTTP server")
 		return
 	}
-	klog.Infof("Starting HTTP server at endpoint: %v\n", httpEndpoint)
+	logger.Info("Starting HTTP server", "endpoint", httpEndpoint)
 
 	// Prepare http endpoint for healthz + profiling (if enabled)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
+		logger := klog.FromContext(req.Context())
 		socketExists, err := util.DoesSocketExist(socketPath)
 		if err == nil && socketExists {
-			grpcSocketCheckError := checkLiveRegistrationSocket(socketPath, csiDriverName)
+			grpcSocketCheckError := checkLiveRegistrationSocket(ctx, socketPath, csiDriverName)
 			if grpcSocketCheckError != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(grpcSocketCheckError.Error()))
-				klog.Errorf("health check failed: %+v", grpcSocketCheckError)
+				logger.Error(grpcSocketCheckError, "Health check failed")
 			} else {
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte(`ok`))
-				klog.V(5).Infof("health check succeeded")
+				logger.V(5).Info("Health check succeeded")
 			}
 		} else if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(err.Error()))
-			klog.Errorf("health check failed: %+v", err)
+			logger.Error(err, "Health check failed")
 		} else if !socketExists {
 			w.WriteHeader(http.StatusNotFound)
 			w.Write([]byte("registration socket does not exist"))
-			klog.Errorf("health check failed, registration socket does not exist")
+			logger.Error(nil, "Health check failed, registration socket does not exist")
 		}
 	})
 
 	if *enableProfile {
-		klog.InfoS("Starting profiling", "endpoint", httpEndpoint)
+		logger.Info("Starting profiling", "endpoint", httpEndpoint)
 
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
@@ -126,19 +135,21 @@ func httpServer(socketPath string, httpEndpoint string, csiDriverName string) {
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	}
 
-	klog.Fatal(http.ListenAndServe(httpEndpoint, mux))
+	logger.Error(http.ListenAndServe(httpEndpoint, mux), "")
+	klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 }
 
-func checkLiveRegistrationSocket(socketFile, csiDriverName string) error {
-	klog.V(2).Infof("Attempting to open a gRPC connection with: %q", socketFile)
-	grpcConn, err := connection.ConnectWithoutMetrics(socketFile)
+func checkLiveRegistrationSocket(ctx context.Context, socketFile, csiDriverName string) error {
+	logger := klog.FromContext(ctx)
+	logger.V(2).Info("Attempting to open a gRPC connection", "socketfile", socketFile)
+	grpcConn, err := connection.ConnectWithoutMetrics(ctx, socketFile)
 	if err != nil {
 		return fmt.Errorf("error connecting to node-registrar socket %s: %v", socketFile, err)
 	}
 
-	defer closeGrpcConnection(socketFile, grpcConn)
+	defer closeGrpcConnection(logger, socketFile, grpcConn)
 
-	klog.V(2).Infof("Calling node registrar to check if it still responds")
+	logger.V(2).Info("Calling node registrar to check if it still responds")
 	ctx, cancel := context.WithTimeout(context.Background(), *operationTimeout)
 	defer cancel()
 
@@ -157,23 +168,23 @@ func checkLiveRegistrationSocket(socketFile, csiDriverName string) error {
 	return fmt.Errorf("invalid driver name %s", info.Name)
 }
 
-func closeGrpcConnection(socketFile string, conn *grpc.ClientConn) {
+func closeGrpcConnection(logger klog.Logger, socketFile string, conn *grpc.ClientConn) {
 	err := conn.Close()
 	if err != nil {
-		klog.Errorf("error closing socket %s: %v", socketFile, err)
-		os.Exit(1)
+		logger.Error(err, "Error closing socket", "socketfile", socketFile)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 }
 
-func removeRegSocket(csiDriverName string) {
+func removeRegSocket(logger klog.Logger, csiDriverName string) {
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGTERM)
 	<-sigc
 	socketPath := buildSocketPath(csiDriverName)
 	err := os.Remove(socketPath)
 	if err != nil && !os.IsNotExist(err) {
-		klog.Errorf("failed to remove socket: %s with error: %+v", socketPath, err)
-		os.Exit(1)
+		logger.Error(err, "Failed to remove socket with error", "socket", socketPath)
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 	os.Exit(0)
 }

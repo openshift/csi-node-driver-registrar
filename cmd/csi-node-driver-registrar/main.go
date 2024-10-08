@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	_ "net/http/pprof"
@@ -29,6 +30,10 @@ import (
 
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
 	csirpc "github.com/kubernetes-csi/csi-lib-utils/rpc"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/component-base/logs"
+	logsapi "k8s.io/component-base/logs/api/v1"
+	_ "k8s.io/component-base/logs/json/register"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 )
 
@@ -87,7 +92,8 @@ func newRegistrationServer(driverName string, endpoint string, versions []string
 
 // GetInfo is the RPC invoked by plugin watcher
 func (e registrationServer) GetInfo(ctx context.Context, req *registerapi.InfoRequest) (*registerapi.PluginInfo, error) {
-	klog.Infof("Received GetInfo call: %+v", req)
+	logger := klog.FromContext(ctx)
+	logger.Info("Received GetInfo call", "request", req)
 
 	return &registerapi.PluginInfo{
 		Type:              registerapi.CSIPlugin,
@@ -98,9 +104,10 @@ func (e registrationServer) GetInfo(ctx context.Context, req *registerapi.InfoRe
 }
 
 func (e registrationServer) NotifyRegistrationStatus(ctx context.Context, status *registerapi.RegistrationStatus) (*registerapi.RegistrationStatusResponse, error) {
-	klog.Infof("Received NotifyRegistrationStatus call: %+v", status)
+	logger := klog.FromContext(ctx)
+	logger.Info("Received NotifyRegistrationStatus call", "status", status)
 	if !status.PluginRegistered {
-		klog.Errorf("Registration process failed with error: %+v, restarting registration container.", status.Error)
+		logger.Error(errors.New(status.Error), "Registration process failed with error, restarting registration container")
 		os.Exit(1)
 	}
 
@@ -112,9 +119,17 @@ func modeIsKubeletRegistrationProbe() bool {
 }
 
 func main() {
-	klog.InitFlags(nil)
-	flag.Set("logtostderr", "true")
+	fg := featuregate.NewFeatureGate()
+	logsapi.AddFeatureGates(fg)
+	c := logsapi.NewLoggingConfiguration()
+	logsapi.AddGoFlags(c, flag.CommandLine)
+	logs.InitLogs()
 	flag.Parse()
+	logger := klog.Background()
+	if err := logsapi.ValidateAndApply(c, fg); err != nil {
+		logger.Error(err, "LoggingConfiguration is invalid")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
 
 	if *showVersion {
 		fmt.Println(os.Args[0], version)
@@ -122,8 +137,8 @@ func main() {
 	}
 
 	if *kubeletRegistrationPath == "" {
-		klog.Error("kubelet-registration-path is a required parameter")
-		os.Exit(1)
+		logger.Error(nil, "kubelet-registration-path is a required parameter")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	if modeIsKubeletRegistrationProbe() {
@@ -132,12 +147,12 @@ func main() {
 		os.Exit(0)
 	}
 
-	klog.Infof("Version: %s", version)
-	klog.Infof("Running node-driver-registrar in mode=%s", *mode)
+	logger.Info("Version", "version", version)
+	logger.Info("Running node-driver-registrar", "mode", *mode)
 
 	if *healthzPort > 0 && *httpEndpoint != "" {
-		klog.Error("only one of `--health-port` and `--http-endpoint` can be set.")
-		os.Exit(1)
+		logger.Error(nil, "Only one of `--health-port` and `--http-endpoint` can be set")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 	var addr string
 	if *healthzPort > 0 {
@@ -147,32 +162,33 @@ func main() {
 	}
 
 	if *connectionTimeout != 0 {
-		klog.Warning("--connection-timeout is deprecated and will have no effect")
+		logger.Info("--connection-timeout is deprecated and will have no effect")
 	}
 
 	// Once https://github.com/container-storage-interface/spec/issues/159 is
 	// resolved, if plugin does not support PUBLISH_UNPUBLISH_VOLUME, then we
 	// can skip adding mapping to "csi.volume.kubernetes.io/nodeid" annotation.
 
-	klog.V(1).Infof("Attempting to open a gRPC connection with: %q", *csiAddress)
-	csiConn, err := connection.ConnectWithoutMetrics(*csiAddress)
+	logger.V(1).Info("Attempting to open a gRPC connection", "csiAddress", *csiAddress)
+	ctx := klog.NewContext(context.Background(), logger)
+	csiConn, err := connection.ConnectWithoutMetrics(ctx, *csiAddress)
 	if err != nil {
-		klog.Errorf("error connecting to CSI driver: %v", err)
-		os.Exit(1)
+		logger.Error(err, "Error connecting to CSI driver")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	klog.V(1).Infof("Calling CSI driver to discover driver name")
-	ctx, cancel := context.WithTimeout(context.Background(), *operationTimeout)
+	logger.V(1).Info("Calling CSI driver to discover driver name")
+	getNameCtx, cancel := context.WithTimeout(ctx, *operationTimeout)
 	defer cancel()
 
-	csiDriverName, err := csirpc.GetDriverName(ctx, csiConn)
+	csiDriverName, err := csirpc.GetDriverName(getNameCtx, csiConn)
 	if err != nil {
-		klog.Errorf("error retreiving CSI driver name: %v", err)
-		os.Exit(1)
+		logger.Error(err, "Error retreiving CSI driver name")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
-	klog.V(2).Infof("CSI driver name: %q", csiDriverName)
-	defer closeGrpcConnection(*csiAddress, csiConn)
+	logger.V(2).Info("CSI driver name", "csiDriverName", csiDriverName)
+	defer closeGrpcConnection(logger, *csiAddress, csiConn)
 
 	// Run forever
-	nodeRegister(csiDriverName, addr)
+	nodeRegister(ctx, csiDriverName, addr)
 }
