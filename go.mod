@@ -137,3 +137,6 @@ replace k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.35.0
 replace k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.35.0
 
 replace k8s.io/sample-controller => k8s.io/sample-controller v0.35.0
+
+// CVE-2026-35469
+replace github.com/moby/spdystream => github.com/moby/spdystream v0.5.1
